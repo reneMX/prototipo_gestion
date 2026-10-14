@@ -24,18 +24,48 @@ const TIPOS = ["image/jpeg", "image/png", "image/webp"];
 const uso = new Map();
 
 const NOMBRES_CLAVE = ["GEMINI_API_KEY", "MODEL_PROTO"];
-const getKey = () => {
+const getKeyInfo = () => {
   for (const n of NOMBRES_CLAVE) {
     let v = "";
     try { v = (globalThis.Netlify && Netlify.env.get(n)) || ""; } catch {}
-    v = v || process.env[n] || "";
-    if (v) return v;
+    v = (v || process.env[n] || "").trim();
+    if (v) return { nombre: n, valor: v };
   }
-  return "";
+  return { nombre: null, valor: "" };
 };
+const getKey = () => getKeyInfo().valor;
+
+async function diagnostico() {
+  const { nombre, valor } = getKeyInfo();
+  const out = {
+    variable_usada: nombre || "ninguna",
+    largo_clave: valor.length,
+    empieza_con: valor.slice(0, 4),
+    termina_con: valor.slice(-3),
+    contexto_netlify: process.env.CONTEXT || "desconocido",
+  };
+  if (!valor) return Response.json(out);
+  const pruebas = {
+    ai_studio_encabezado: ["https://generativelanguage.googleapis.com/v1beta/models", { "x-goog-api-key": valor }],
+    ai_studio_parametro: ["https://generativelanguage.googleapis.com/v1beta/models?key=" + encodeURIComponent(valor), {}],
+    vertex_express: ["https://aiplatform.googleapis.com/v1beta1/publishers/google/models/gemini-2.5-flash:generateContent", { "x-goog-api-key": valor, "content-type": "application/json" }],
+  };
+  for (const [k, [url, headers]] of Object.entries(pruebas)) {
+    try {
+      const isPost = k === "vertex_express";
+      const r = await fetch(url, { method: isPost ? "POST" : "GET", headers, body: isPost ? JSON.stringify({ contents: [{ role: "user", parts: [{ text: "di ok" }] }] }) : undefined });
+      const t = await r.text();
+      let msg = "";
+      try { msg = JSON.parse(t).error?.message || ""; } catch {}
+      out[k] = r.ok ? "OK (" + r.status + ")" : r.status + " " + msg.slice(0, 140);
+    } catch (e) { out[k] = "sin conexión"; }
+  }
+  return Response.json(out);
+}
 const err = (msg, status) => Response.json({ error: msg }, { status });
 
 export default async (req, context) => {
+  if (req.method === "GET" && new URL(req.url).searchParams.has("diagnostico")) return diagnostico();
   if (req.method !== "POST") return err("Usa POST", 405);
 
   // 1. Solo acepta peticiones desde tu propio sitio
@@ -72,27 +102,34 @@ export default async (req, context) => {
     { text: PROMPT },
   ];
 
-  // 4. Llamar a Gemini (la clave va en encabezado, nunca en la URL). Si un modelo no existe, prueba el siguiente.
-  const modelos = [...new Set([process.env.GEMINI_MODEL, MODEL, "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"].filter(Boolean))];
+  // 4. Llamar a Gemini. Las claves AQ.… pueden ser de AI Studio o de Vertex AI (modo express):
+  //    se prueba AI Studio y, si rechaza la clave, Vertex. Si un modelo no existe (404), se prueba el siguiente.
+  const modelos = [...new Set([process.env.GEMINI_MODEL, MODEL, "gemini-2.5-flash", "gemini-2.0-flash"].filter(Boolean))];
+  const hosts = [
+    (m) => `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`,
+    (m) => `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${encodeURIComponent(KEY)}`,
+    (m) => `https://aiplatform.googleapis.com/v1beta1/publishers/google/models/${m}:generateContent`,
+  ];
+  const payload = JSON.stringify({
+    contents: [{ role: "user", parts }],
+    generationConfig: { temperature: 0.1, maxOutputTokens: 2000, responseMimeType: "application/json" },
+  });
   let res, detalle = "";
-  for (const m of modelos) {
-    try {
-      res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
-        method: "POST",
-        headers: { "x-goog-api-key": KEY, "content-type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts }],
-          generationConfig: { temperature: 0.1, maxOutputTokens: 2000, responseMimeType: "application/json" },
-        }),
-      });
-    } catch (e) {
-      console.error("Sin conexión con Gemini:", e);
-      return err("No hay conexión con la IA. Intenta de nuevo.", 502);
+  intento: for (const host of hosts) {
+    for (const m of modelos) {
+      try {
+        res = await fetch(host(m), { method: "POST", headers: { "x-goog-api-key": KEY, "content-type": "application/json" }, body: payload });
+      } catch (e) {
+        console.error("Sin conexión con Gemini:", e);
+        return err("No hay conexión con la IA. Intenta de nuevo.", 502);
+      }
+      if (res.ok) break intento;
+      detalle = await res.text();
+      console.error("Gemini", host(m), res.status, detalle.slice(0, 300));
+      if (res.status === 404) continue;          // modelo no existe aquí: siguiente modelo
+      if (res.status === 401 || res.status === 403 || (res.status === 400 && /API key|credential|ACCESS_TOKEN/i.test(detalle))) continue intento; // clave de otro tipo: siguiente host
+      break intento;                              // 429 u otro error: no seguir gastando
     }
-    if (res.ok) break;
-    detalle = await res.text();
-    console.error("Gemini", m, res.status, detalle);
-    if (res.status !== 404) break;
   }
 
   if (!res.ok) {
