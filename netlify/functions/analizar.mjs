@@ -13,7 +13,7 @@ Reglas:
 - Si no reconoces ningún producto, responde {"productos":[]}.`;
 
 // Modelo configurable desde Netlify (variable GEMINI_MODEL).
-const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const MODEL = "gemini-flash-latest";
 
 // Seguridad
 const MAX_FOTOS = 4;
@@ -72,26 +72,39 @@ export default async (req, context) => {
     { text: PROMPT },
   ];
 
-  // 4. Llamar a Gemini (la clave va en encabezado, nunca en la URL)
-  let res;
-  try {
-    res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`, {
-      method: "POST",
-      headers: { "x-goog-api-key": KEY, "content-type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 2000, responseMimeType: "application/json" },
-      }),
-    });
-  } catch (e) {
-    console.error("Sin conexión con Gemini:", e);
-    return err("La IA no respondió. Intenta de nuevo.", 502);
+  // 4. Llamar a Gemini (la clave va en encabezado, nunca en la URL). Si un modelo no existe, prueba el siguiente.
+  const modelos = [...new Set([process.env.GEMINI_MODEL, MODEL, "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"].filter(Boolean))];
+  let res, detalle = "";
+  for (const m of modelos) {
+    try {
+      res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent`, {
+        method: "POST",
+        headers: { "x-goog-api-key": KEY, "content-type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts }],
+          generationConfig: { temperature: 0.1, maxOutputTokens: 2000, responseMimeType: "application/json" },
+        }),
+      });
+    } catch (e) {
+      console.error("Sin conexión con Gemini:", e);
+      return err("No hay conexión con la IA. Intenta de nuevo.", 502);
+    }
+    if (res.ok) break;
+    detalle = await res.text();
+    console.error("Gemini", m, res.status, detalle);
+    if (res.status !== 404) break;
   }
 
   if (!res.ok) {
-    console.error("Error de Gemini:", res.status, await res.text());
-    if (res.status === 429) return err("La IA está saturada. Intenta en un minuto.", 429);
-    return err("La IA no respondió. Intenta de nuevo.", 502);
+    let msg = "";
+    try { msg = JSON.parse(detalle).error?.message || ""; } catch {}
+    const motivo =
+      res.status === 400 && /API key/i.test(msg) ? "La clave de Gemini no es válida. Revísala en Netlify." :
+      res.status === 403 ? "La clave no tiene permiso para usar Gemini (revisa que la API esté activada en Google AI Studio)." :
+      res.status === 429 ? "Se acabó la cuota de Gemini por ahora. Intenta en un minuto." :
+      res.status === 404 ? "Ningún modelo de Gemini disponible. Pon un modelo válido en la variable GEMINI_MODEL." :
+      "La IA no respondió.";
+    return err(`${motivo} [${res.status}] ${msg.slice(0, 160)}`, 502);
   }
 
   const data = await res.json();
