@@ -23,6 +23,16 @@ const VENTANA_MS = 60 * 60 * 1000;          // ...por hora (mejor esfuerzo, por 
 const TIPOS = ["image/jpeg", "image/png", "image/webp"];
 const uso = new Map();
 
+const NOMBRES_CLAVE = ["GEMINI_API_KEY", "MODEL_PROTO"];
+const getKey = () => {
+  for (const n of NOMBRES_CLAVE) {
+    let v = "";
+    try { v = (globalThis.Netlify && Netlify.env.get(n)) || ""; } catch {}
+    v = v || process.env[n] || "";
+    if (v) return v;
+  }
+  return "";
+};
 const err = (msg, status) => Response.json({ error: msg }, { status });
 
 export default async (req, context) => {
@@ -35,7 +45,8 @@ export default async (req, context) => {
     return err("Origen no permitido", 403);
   }
 
-  if (!process.env.GEMINI_API_KEY) return err("Falta configurar la clave de la IA en Netlify.", 500);
+  const KEY = getKey().trim();
+  if (!KEY) return err("Falta configurar la clave de la IA en Netlify.", 500);
 
   // 2. Límite de consultas por IP
   const ip = context?.ip || req.headers.get("x-nf-client-connection-ip") || "anon";
@@ -66,7 +77,7 @@ export default async (req, context) => {
   try {
     res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`, {
       method: "POST",
-      headers: { "x-goog-api-key": process.env.GEMINI_API_KEY, "content-type": "application/json" },
+      headers: { "x-goog-api-key": KEY, "content-type": "application/json" },
       body: JSON.stringify({
         contents: [{ role: "user", parts }],
         generationConfig: { temperature: 0.1, maxOutputTokens: 2000, responseMimeType: "application/json" },
